@@ -2,11 +2,13 @@ import os
 import sys
 import html
 import json
+import socket
 import random
 import string
 import asyncio
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
+from telegram.request import HTTPXRequest
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -18,6 +20,18 @@ from telegram.ext import (
 from telethon import TelegramClient
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
+
+# Force IPv4 to prevent Render IPv6 ReadTimeout with Telegram servers
+_orig_getaddrinfo = socket.getaddrinfo
+
+
+def _ipv4_getaddrinfo(*args, **kwargs):
+    res = _orig_getaddrinfo(*args, **kwargs)
+    ipv4 = [r for r in res if r[0] == socket.AF_INET]
+    return ipv4 if ipv4 else res
+
+
+socket.getaddrinfo = _ipv4_getaddrinfo
 
 # Environment Variables
 raw_api_id = os.environ.get("API_ID", "").strip()
@@ -52,8 +66,11 @@ def load_data():
 
 
 def save_data(data):
-    with open(DATA_FILE, "w", encoding="utf-8") as f:
-        json.dump(data, f, ensure_ascii=False, indent=2)
+    try:
+        with open(DATA_FILE, "w", encoding="utf-8") as f:
+            json.dump(data, f, ensure_ascii=False, indent=2)
+    except Exception as e:
+        print(f"Save warning: {e}")
 
 
 config = load_data()
@@ -69,6 +86,9 @@ def create_telethon_client(session_str=""):
         device_model="Samsung Galaxy S23",
         system_version="Android 14",
         app_version="10.14.5",
+        connection_retries=5,
+        retry_delay=3,
+        timeout=30,
     )
 
 
@@ -124,16 +144,14 @@ async def ad_worker():
         return
 
     user_client = create_telethon_client(config["session"])
-    await user_client.connect()
-
-    if not await user_client.is_user_authorized():
-        config["running"] = False
-        config["session"] = ""
-        save_data(config)
-        await user_client.disconnect()
-        return
-
     try:
+        await user_client.connect()
+        if not await user_client.is_user_authorized():
+            config["running"] = False
+            config["session"] = ""
+            save_data(config)
+            return
+
         while config.get("running"):
             ad_text = config.get("ad_text", "").strip()
             if not ad_text:
@@ -168,8 +186,13 @@ async def ad_worker():
                 if not config.get("running"):
                     break
                 await asyncio.sleep(1)
+    except Exception as e:
+        print(f"Ad worker error: {e}")
     finally:
-        await user_client.disconnect()
+        try:
+            await user_client.disconnect()
+        except Exception:
+            pass
 
 
 def start_ad_loop():
@@ -179,6 +202,8 @@ def start_ad_loop():
 
 
 async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message:
+        return
     uid = update.effective_user.id
     if OWNER_ID and uid != OWNER_ID:
         return
@@ -190,6 +215,8 @@ async def start_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     query = update.callback_query
+    if not query or not query.from_user:
+        return
     uid = query.from_user.id
     if OWNER_ID and uid != OWNER_ID:
         return
@@ -261,6 +288,8 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    if not update.effective_user or not update.message or not update.message.text:
+        return
     uid = update.effective_user.id
     if OWNER_ID and uid != OWNER_ID:
         return
@@ -275,8 +304,8 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Step 1: Phone Number
     if step == "WAIT_PHONE":
         client = create_telethon_client()
-        await client.connect()
         try:
+            await client.connect()
             sent = await client.send_code_request(msg_text)
             user_states[uid] = {
                 "step": "WAIT_CODE",
@@ -289,7 +318,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
             )
         except Exception as e:
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             user_states.pop(uid, None)
             await update.message.reply_text(
                 f"Error: {html.escape(str(e))}\nDobara /start bhejein.",
@@ -323,7 +355,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "Is account par 2-Step Verification (Password) laga hai. Apna password bhejein:"
             )
         except Exception as e:
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             user_states.pop(uid, None)
             await update.message.reply_text(
                 f"Login failed: {html.escape(str(e))}\nDobara /start bhejein.",
@@ -346,14 +381,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
             )
         except Exception as e:
-            await client.disconnect()
+            try:
+                await client.disconnect()
+            except Exception:
+                pass
             user_states.pop(uid, None)
             await update.message.reply_text(
                 f"Galat password: {html.escape(str(e))}\nDobara /start bhejein.",
                 parse_mode="HTML",
             )
 
-    # Step 4: Set Ad -> Auto move to Set Delay (if in setup flow)
+    # Step 4: Set Ad -> Auto move to Set Delay
     elif step == "WAIT_AD":
         config["ad_text"] = msg_text
         save_data(config)
@@ -375,7 +413,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
             )
 
-    # Step 5: Set Delay -> Auto Start Bot (if in setup flow)
+    # Step 5: Set Delay -> Auto Start Bot
     elif step == "WAIT_DELAY":
         if not msg_text.isdigit() or int(msg_text) < 10:
             await update.message.reply_text("Kam se kam 10 seconds ka valid number bhejein:")
@@ -405,6 +443,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             )
 
 
+async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
+    print(f"Handled network/runtime warning: {context.error}")
+
+
 async def health_check(request):
     return web.Response(text="Ad Bot is alive!")
 
@@ -421,22 +463,54 @@ async def start_web_server():
 
 async def main():
     await start_web_server()
+    print("Web server bound successfully.")
 
-    application = Application.builder().token(BOT_TOKEN).build()
-    application.add_handler(CommandHandler("start", start_handler))
-    application.add_handler(CallbackQueryHandler(callback_handler))
-    application.add_handler(MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler))
+    while True:
+        try:
+            req = HTTPXRequest(
+                connect_timeout=30.0,
+                read_timeout=30.0,
+                write_timeout=30.0,
+                pool_timeout=30.0,
+            )
+            updates_req = HTTPXRequest(
+                connect_timeout=30.0,
+                read_timeout=30.0,
+                write_timeout=30.0,
+                pool_timeout=30.0,
+            )
 
-    await application.initialize()
-    await application.start()
-    await application.updater.start_polling(drop_pending_updates=True)
+            application = (
+                Application.builder()
+                .token(BOT_TOKEN)
+                .request(req)
+                .get_updates_request(updates_req)
+                .build()
+            )
+            application.add_handler(CommandHandler("start", start_handler))
+            application.add_handler(CallbackQueryHandler(callback_handler))
+            application.add_handler(
+                MessageHandler(filters.TEXT & ~filters.COMMAND, message_handler)
+            )
+            application.add_error_handler(error_handler)
 
-    print("Controller Bot & Web Server successfully started!")
+            await application.initialize()
+            await application.start()
+            await application.updater.start_polling(
+                drop_pending_updates=True,
+                timeout=20,
+            )
 
-    if config.get("running") and config.get("session"):
-        start_ad_loop()
+            print("Controller Bot successfully started and connected!")
 
-    await asyncio.Event().wait()
+            if config.get("running") and config.get("session"):
+                start_ad_loop()
+
+            await asyncio.Event().wait()
+
+        except Exception as e:
+            print(f"Connection retry in 5s due to: {e}")
+            await asyncio.sleep(5)
 
 
 if __name__ == "__main__":
