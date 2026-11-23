@@ -1,4 +1,5 @@
 import os
+import sys
 import json
 import random
 import string
@@ -8,16 +9,22 @@ from telethon import TelegramClient, events, Button
 from telethon.sessions import StringSession
 from telethon.errors import SessionPasswordNeededError, FloodWaitError
 
-# Environment Variables (Render Dashboard mein set karne hain)
-API_ID = int(os.environ.get("API_ID", 0))
-API_HASH = os.environ.get("API_HASH", "")
-BOT_TOKEN = os.environ.get("BOT_TOKEN", "")
-OWNER_ID = int(os.environ.get("OWNER_ID", 0))  # Apni Telegram User ID daalein
+# Environment Variables Validation
+raw_api_id = os.environ.get("API_ID", "").strip()
+API_HASH = os.environ.get("API_HASH", "").strip()
+BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
+raw_owner_id = os.environ.get("OWNER_ID", "0").strip()
+
+if not raw_api_id.isdigit() or not API_HASH or not BOT_TOKEN:
+    print("ERROR: Render Environment Variables mein API_ID, API_HASH, aur BOT_TOKEN sahi se set karein!")
+    sys.exit(1)
+
+API_ID = int(raw_api_id)
+OWNER_ID = int(raw_owner_id) if raw_owner_id.isdigit() else 0
 
 DATA_FILE = "bot_data.json"
 SPECIAL_CHARS = "-/:(()₹&@“.’"
 
-# Data load/save helper
 def load_data():
     if os.path.exists(DATA_FILE):
         with open(DATA_FILE, "r", encoding="utf-8") as f:
@@ -37,7 +44,6 @@ config = load_data()
 user_states = {}
 ad_task = None
 
-# Random special characters + numbers generator
 def generate_noise():
     length = random.randint(3, 6)
     pool = SPECIAL_CHARS + string.digits
@@ -47,9 +53,6 @@ def format_human_ad(base_text):
     prefix = generate_noise()
     suffix = generate_noise()
     return f"{prefix} {base_text} {suffix}"
-
-# Controller Bot Client
-bot = TelegramClient("controller_bot", API_ID, API_HASH)
 
 def get_main_menu():
     acc_status = "Logged In" if config.get("session") else "Not Logged In"
@@ -74,7 +77,6 @@ def get_main_menu():
     ]
     return text, buttons
 
-# Background Ad Sender Loop
 async def ad_worker():
     global config
     if not config.get("session"):
@@ -103,14 +105,12 @@ async def ad_worker():
                     break
                 if dialog.is_group:
                     try:
-                        # Human-like typing action
                         async with user_client.action(dialog.id, "typing"):
                             await asyncio.sleep(random.uniform(1.5, 3.5))
 
                         final_msg = format_human_ad(ad_text)
                         await user_client.send_message(dialog.id, final_msg)
 
-                        # Har group ke beech natural pause
                         await asyncio.sleep(random.uniform(3.0, 7.0))
 
                     except FloodWaitError as e:
@@ -118,7 +118,6 @@ async def ad_worker():
                     except Exception:
                         continue
 
-            # Ek round poora hone ke baad set delay + random human jitter
             base_delay = int(config.get("delay", 120))
             jitter = random.randint(5, 25)
             total_sleep = base_delay + jitter
@@ -130,176 +129,168 @@ async def ad_worker():
     finally:
         await user_client.disconnect()
 
-# Start Command
-@bot.on(events.NewMessage(pattern="/start"))
-async def start_handler(event):
-    if OWNER_ID and event.sender_id != OWNER_ID:
-        return
-    user_states.pop(event.sender_id, None)
-    text, buttons = get_main_menu()
-    await event.respond(text, buttons=buttons)
-
-# Button Callbacks
-@bot.on(events.CallbackQuery)
-async def callback_handler(event):
-    global ad_task
-    uid = event.sender_id
-    if OWNER_ID and uid != OWNER_ID:
-        return
-
-    data = event.data.decode("utf-8")
-
-    if data == "login_acc":
-        user_states[uid] = {"step": "WAIT_PHONE"}
-        await event.edit(
-            "Apna Telegram phone number country code ke saath bhejein (jaise `+919876543210`):",
-            buttons=[[Button.inline("Cancel", b"cancel")]]
-        )
-
-    elif data == "set_ad":
-        user_states[uid] = {"step": "WAIT_AD"}
-        await event.edit(
-            "Apna Ad message bhejein (is text ke aage aur peeche automatic special characters + numbers lag jayenge):",
-            buttons=[[Button.inline("Cancel", b"cancel")]]
-        )
-
-    elif data == "set_delay":
-        user_states[uid] = {"step": "WAIT_DELAY"}
-        await event.edit(
-            "Har round ke beech kitne seconds ka delay rakhna hai? Number bhejein (jaise `60` ya `300`):",
-            buttons=[[Button.inline("Cancel", b"cancel")]]
-        )
-
-    elif data == "start_bot":
-        if not config.get("session"):
-            await event.answer("Pehle Account Login karein!", alert=True)
+def register_handlers(bot):
+    @bot.on(events.NewMessage(pattern="/start"))
+    async def start_handler(event):
+        if OWNER_ID and event.sender_id != OWNER_ID:
             return
-        if not config.get("ad_text"):
-            await event.answer("Pehle Ad Message set karein!", alert=True)
-            return
-        if config.get("running"):
-            await event.answer("Bot pehle se chal raha hai!", alert=True)
+        user_states.pop(event.sender_id, None)
+        text, buttons = get_main_menu()
+        await event.respond(text, buttons=buttons)
+
+    @bot.on(events.CallbackQuery)
+    async def callback_handler(event):
+        global ad_task
+        uid = event.sender_id
+        if OWNER_ID and uid != OWNER_ID:
             return
 
-        config["running"] = True
-        save_data(config)
-        ad_task = asyncio.create_task(ad_worker())
-        text, buttons = get_main_menu()
-        await event.edit(text, buttons=buttons)
+        data = event.data.decode("utf-8")
 
-    elif data == "stop_bot":
-        config["running"] = False
-        save_data(config)
-        text, buttons = get_main_menu()
-        await event.edit(text, buttons=buttons)
-
-    elif data == "cancel":
-        user_states.pop(uid, None)
-        text, buttons = get_main_menu()
-        await event.edit(text, buttons=buttons)
-
-# Conversation Steps Handler
-@bot.on(events.NewMessage)
-async def message_handler(event):
-    uid = event.sender_id
-    if OWNER_ID and uid != OWNER_ID:
-        return
-    if event.text and event.text.startswith("/"):
-        return
-
-    state = user_states.get(uid)
-    if not state:
-        return
-
-    step = state.get("step")
-    msg_text = event.text.strip()
-
-    # Step 1: Phone Number
-    if step == "WAIT_PHONE":
-        client = TelegramClient(StringSession(), API_ID, API_HASH)
-        await client.connect()
-        try:
-            sent = await client.send_code_request(msg_text)
-            user_states[uid] = {
-                "step": "WAIT_CODE",
-                "phone": msg_text,
-                "hash": sent.phone_code_hash,
-                "client": client
-            }
-            await event.respond(
-                "Telegram par OTP aaya hoga. **Spaces ke saath** OTP bhejein (jaise `1 2 3 4 5`), warna Telegram code block kar deta hai:"
+        if data == "login_acc":
+            user_states[uid] = {"step": "WAIT_PHONE"}
+            await event.edit(
+                "Apna Telegram phone number country code ke saath bhejein (jaise `+919876543210`):",
+                buttons=[[Button.inline("Cancel", b"cancel")]]
             )
-        except Exception as e:
-            await client.disconnect()
+
+        elif data == "set_ad":
+            user_states[uid] = {"step": "WAIT_AD"}
+            await event.edit(
+                "Apna Ad message bhejein (is text ke aage aur peeche automatic special characters + numbers lag jayenge):",
+                buttons=[[Button.inline("Cancel", b"cancel")]]
+            )
+
+        elif data == "set_delay":
+            user_states[uid] = {"step": "WAIT_DELAY"}
+            await event.edit(
+                "Har round ke beech kitne seconds ka delay rakhna hai? Number bhejein (jaise `60` ya `300`):",
+                buttons=[[Button.inline("Cancel", b"cancel")]]
+            )
+
+        elif data == "start_bot":
+            if not config.get("session"):
+                await event.answer("Pehle Account Login karein!", alert=True)
+                return
+            if not config.get("ad_text"):
+                await event.answer("Pehle Ad Message set karein!", alert=True)
+                return
+            if config.get("running"):
+                await event.answer("Bot pehle se chal raha hai!", alert=True)
+                return
+
+            config["running"] = True
+            save_data(config)
+            ad_task = asyncio.create_task(ad_worker())
+            text, buttons = get_main_menu()
+            await event.edit(text, buttons=buttons)
+
+        elif data == "stop_bot":
+            config["running"] = False
+            save_data(config)
+            text, buttons = get_main_menu()
+            await event.edit(text, buttons=buttons)
+
+        elif data == "cancel":
             user_states.pop(uid, None)
-            await event.respond(f"Error: {e}\nDobara /start bhejein.")
+            text, buttons = get_main_menu()
+            await event.edit(text, buttons=buttons)
 
-    # Step 2: OTP Code
-    elif step == "WAIT_CODE":
-        code = msg_text.replace(" ", "").replace("-", "")
-        client = state["client"]
-        try:
-            await client.sign_in(
-                phone=state["phone"],
-                code=code,
-                phone_code_hash=state["hash"]
-            )
-            session_str = client.session.save()
-            await client.disconnect()
-            config["session"] = session_str
+    @bot.on(events.NewMessage)
+    async def message_handler(event):
+        uid = event.sender_id
+        if OWNER_ID and uid != OWNER_ID:
+            return
+        if event.text and event.text.startswith("/"):
+            return
+
+        state = user_states.get(uid)
+        if not state:
+            return
+
+        step = state.get("step")
+        msg_text = event.text.strip()
+
+        if step == "WAIT_PHONE":
+            client = TelegramClient(StringSession(), API_ID, API_HASH)
+            await client.connect()
+            try:
+                sent = await client.send_code_request(msg_text)
+                user_states[uid] = {
+                    "step": "WAIT_CODE",
+                    "phone": msg_text,
+                    "hash": sent.phone_code_hash,
+                    "client": client
+                }
+                await event.respond(
+                    "Telegram par OTP aaya hoga. **Spaces ke saath** OTP bhejein (jaise `1 2 3 4 5`), warna Telegram code block kar deta hai:"
+                )
+            except Exception as e:
+                await client.disconnect()
+                user_states.pop(uid, None)
+                await event.respond(f"Error: {e}\nDobara /start bhejein.")
+
+        elif step == "WAIT_CODE":
+            code = msg_text.replace(" ", "").replace("-", "")
+            client = state["client"]
+            try:
+                await client.sign_in(
+                    phone=state["phone"],
+                    code=code,
+                    phone_code_hash=state["hash"]
+                )
+                session_str = client.session.save()
+                await client.disconnect()
+                config["session"] = session_str
+                save_data(config)
+                user_states.pop(uid, None)
+
+                text, buttons = get_main_menu()
+                await event.respond("Account successfully login ho gaya!", buttons=buttons)
+
+            except SessionPasswordNeededError:
+                state["step"] = "WAIT_2FA"
+                await event.respond("Is account par 2-Step Verification (Password) laga hai. Apna password bhejein:")
+            except Exception as e:
+                await client.disconnect()
+                user_states.pop(uid, None)
+                await event.respond(f"Login failed: {e}\nDobara /start bhejein.")
+
+        elif step == "WAIT_2FA":
+            client = state["client"]
+            try:
+                await client.sign_in(password=msg_text)
+                session_str = client.session.save()
+                await client.disconnect()
+                config["session"] = session_str
+                save_data(config)
+                user_states.pop(uid, None)
+
+                text, buttons = get_main_menu()
+                await event.respond("2FA verified! Account login ho gaya.", buttons=buttons)
+            except Exception as e:
+                await client.disconnect()
+                user_states.pop(uid, None)
+                await event.respond(f"Galat password: {e}\nDobara /start bhejein.")
+
+        elif step == "WAIT_AD":
+            config["ad_text"] = msg_text
             save_data(config)
             user_states.pop(uid, None)
-
+            sample = format_human_ad(msg_text)
             text, buttons = get_main_menu()
-            await event.respond("Account successfully login ho gaya!", buttons=buttons)
+            await event.respond(f"Ad save ho gaya!\n\n**Preview:**\n`{sample}`", buttons=buttons)
 
-        except SessionPasswordNeededError:
-            state["step"] = "WAIT_2FA"
-            await event.respond("Is account par 2-Step Verification (Password) laga hai. Apna password bhejein:")
-        except Exception as e:
-            await client.disconnect()
-            user_states.pop(uid, None)
-            await event.respond(f"Login failed: {e}\nDobara /start bhejein.")
-
-    # Step 3: 2FA Password
-    elif step == "WAIT_2FA":
-        client = state["client"]
-        try:
-            await client.sign_in(password=msg_text)
-            session_str = client.session.save()
-            await client.disconnect()
-            config["session"] = session_str
+        elif step == "WAIT_DELAY":
+            if not msg_text.isdigit() or int(msg_text) < 10:
+                await event.respond("Kam se kam 10 seconds ka valid number bhejein:")
+                return
+            config["delay"] = int(msg_text)
             save_data(config)
             user_states.pop(uid, None)
-
             text, buttons = get_main_menu()
-            await event.respond("2FA verified! Account login ho gaya.", buttons=buttons)
-        except Exception as e:
-            await client.disconnect()
-            user_states.pop(uid, None)
-            await event.respond(f"Galat password: {e}\nDobara /start bhejein.")
+            await event.respond(f"Delay {msg_text} seconds set ho gaya!", buttons=buttons)
 
-    # Step 4: Save Ad Message
-    elif step == "WAIT_AD":
-        config["ad_text"] = msg_text
-        save_data(config)
-        user_states.pop(uid, None)
-        sample = format_human_ad(msg_text)
-        text, buttons = get_main_menu()
-        await event.respond(f"Ad save ho gaya!\n\n**Preview:**\n`{sample}`", buttons=buttons)
-
-    # Step 5: Save Time Delay
-    elif step == "WAIT_DELAY":
-        if not msg_text.isdigit() or int(msg_text) < 10:
-            await event.respond("Kam se kam 10 seconds ka valid number bhejein:")
-            return
-        config["delay"] = int(msg_text)
-        save_data(config)
-        user_states.pop(uid, None)
-        text, buttons = get_main_menu()
-        await event.respond(f"Delay {msg_text} seconds set ho gaya!", buttons=buttons)
-
-# Render Port Binding Dummy Server
 async def health_check(request):
     return web.Response(text="Ad Bot is alive!")
 
@@ -315,7 +306,10 @@ async def start_web_server():
 async def main():
     global ad_task
     await start_web_server()
+    bot = TelegramClient("controller_bot", API_ID, API_HASH)
+    register_handlers(bot)
     await bot.start(bot_token=BOT_TOKEN)
+    print("Bot successfully started!")
     if config.get("running") and config.get("session"):
         ad_task = asyncio.create_task(ad_worker())
     await bot.run_until_disconnected()
