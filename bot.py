@@ -4,7 +4,6 @@ import html
 import json
 import socket
 import random
-import string
 import asyncio
 from datetime import datetime
 import httpx
@@ -57,26 +56,29 @@ API_ID = int(raw_api_id)
 OWNER_ID = int(raw_owner_id) if raw_owner_id.isdigit() else 0
 
 DATA_FILE = "bot_data.json"
-SPECIAL_CHARS = "-/:(()₹&@“.’"
 
 
 def load_data():
+    default_data = {
+        "session": os.environ.get("SESSION_STRING", "").strip(),
+        "ad_text": os.environ.get("DEFAULT_AD", "").strip(),
+        "delay": int(os.environ.get("DEFAULT_DELAY", "120")),
+        "running": False,
+        "ad_counter": 1,
+    }
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
-                # Fallback to env SESSION_STRING if file session is empty
+                for k, v in default_data.items():
+                    if k not in data:
+                        data[k] = v
                 if not data.get("session") and os.environ.get("SESSION_STRING", "").strip():
                     data["session"] = os.environ.get("SESSION_STRING", "").strip()
                 return data
         except Exception:
             pass
-    return {
-        "session": os.environ.get("SESSION_STRING", "").strip(),
-        "ad_text": os.environ.get("DEFAULT_AD", "").strip(),
-        "delay": int(os.environ.get("DEFAULT_DELAY", "120")),
-        "running": False,
-    }
+    return default_data
 
 
 def save_data(data):
@@ -119,28 +121,24 @@ def create_telethon_client(session_str=""):
     )
 
 
-def generate_noise():
-    length = random.randint(3, 6)
-    pool = SPECIAL_CHARS + string.digits
-    return "".join(random.choice(pool) for _ in range(length))
-
-
 def format_human_ad(base_text):
-    prefix = generate_noise()
-    suffix = generate_noise()
-    return f"{prefix} {base_text} {suffix}"
+    current_num = int(config.get("ad_counter", 1))
+    safe_text = html.escape(base_text)
+    return f"<b>{safe_text}\n{current_num}</b>"
 
 
 def get_main_menu():
     acc_status = "Logged In" if config.get("session") else "Not Logged In"
     ad_status = "Set" if config.get("ad_text") else "Not Set"
     run_status = "RUNNING" if config.get("running") else "STOPPED"
+    next_num = int(config.get("ad_counter", 1))
 
     text = (
         f"<b>Ad Bot Control Panel</b>\n\n"
         f"• <b>Account:</b> {acc_status}\n"
         f"• <b>Ad Text:</b> {ad_status}\n"
         f"• <b>Round Delay:</b> {config.get('delay')} sec\n"
+        f"• <b>Next Ad Number:</b> {next_num}\n"
         f"• <b>Bot Status:</b> {run_status}\n"
         f"• <b>Total Ads Sent:</b> {stats['total_sent']} (Rounds: {stats['rounds_completed']})\n"
         f"• <b>Current State:</b> {html.escape(stats['last_status'])}"
@@ -225,7 +223,8 @@ async def ad_worker():
                     break
 
                 try:
-                    stats["last_status"] = f"Sending ({idx}/{len(groups)}): {dialog.name[:20]}"
+                    current_num = int(config.get("ad_counter", 1))
+                    stats["last_status"] = f"Sending #{current_num} ({idx}/{len(groups)}): {dialog.name[:18]}"
 
                     # Human behavior 1: mark recent messages as read before typing
                     try:
@@ -238,7 +237,11 @@ async def ad_worker():
                         await asyncio.sleep(random.uniform(2.0, 4.2))
 
                     final_msg = format_human_ad(ad_text)
-                    await user_client.send_message(dialog.id, final_msg)
+                    await user_client.send_message(dialog.id, final_msg, parse_mode="html")
+
+                    # Increment counter after every successful send
+                    config["ad_counter"] = current_num + 1
+                    save_data(config)
 
                     sent_count += 1
                     stats["total_sent"] += 1
@@ -273,7 +276,7 @@ async def ad_worker():
 
             await notify_owner(
                 f"<b>Round #{stats['rounds_completed']} Complete</b>\n"
-                f"• <b>Sent:</b> {sent_count} groups\n"
+                f"• <b>Sent:</b> {sent_count} groups (Next Ad #: {config.get('ad_counter', 1)})\n"
                 f"• <b>Skipped/Locked:</b> {skipped_count} groups\n"
                 f"• <b>Next Round:</b> {total_sleep} seconds baad"
             )
@@ -337,7 +340,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await query.answer()
         user_states[uid] = {"step": "WAIT_AD"}
         await query.edit_message_text(
-            "Apna Ad message bhejein (is text ke aage aur peeche automatic special characters + numbers lag jayenge):",
+            "Apna Ad message bhejein (is text ke neeche bina blank line ke 1, 2, 3... number lagega aur poora message <b>Bold</b> format mein jayega):",
             reply_markup=cancel_keyboard(),
             parse_mode="HTML",
         )
@@ -383,7 +386,7 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
         text, keyboard = get_main_menu()
         if config.get("ad_text"):
             sample = format_human_ad(config["ad_text"])
-            text += f"\n\n<b>Live Ad Sample:</b>\n<code>{html.escape(sample)}</code>"
+            text += f"\n\n<b>Next Ad Preview:</b>\n{sample}"
         try:
             await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
         except Exception:
@@ -430,8 +433,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             }
             await update.message.reply_text(
                 "Telegram par OTP aaya hoga.\n"
-                "<b>IMPORTANT:</b> OTP ko <b>spaces ke saath</b> bhejein (jaise <code>1 2 3 4 5</code>), bina spaces ke bhejne par Telegram OTP block kar deta hai:"
-                ,
+                "<b>IMPORTANT:</b> OTP ko <b>spaces ke saath</b> bhejein (jaise <code>1 2 3 4 5</code>), bina spaces ke bhejne par Telegram OTP block kar deta hai:",
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -513,16 +515,17 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 parse_mode="HTML",
             )
 
-    # Step 4: Set Ad -> Auto move to Set Delay
+    # Step 4: Set Ad -> Reset counter to 1 & Auto move to Set Delay
     elif step == "WAIT_AD":
         config["ad_text"] = msg_text
+        config["ad_counter"] = 1
         save_data(config)
         sample = format_human_ad(msg_text)
 
         if state.get("auto_flow"):
             user_states[uid] = {"step": "WAIT_DELAY", "auto_flow": True}
             await update.message.reply_text(
-                f"Ad save ho gaya!\n<b>Preview:</b> <code>{html.escape(sample)}</code>\n\n"
+                f"Ad save ho gaya!\n<b>Preview (1st Ad):</b>\n{sample}\n\n"
                 f"Ab har round ke beech ka <b>Time Delay (seconds mein)</b> bhejein (jaise <code>60</code> ya <code>120</code>):",
                 parse_mode="HTML",
             )
@@ -530,7 +533,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             user_states.pop(uid, None)
             text, keyboard = get_main_menu()
             await update.message.reply_text(
-                f"Ad save ho gaya!\n<b>Preview:</b> <code>{html.escape(sample)}</code>\n\n{text}",
+                f"Ad save ho gaya!\n<b>Preview (1st Ad):</b>\n{sample}\n\n{text}",
                 reply_markup=keyboard,
                 parse_mode="HTML",
             )
@@ -569,7 +572,6 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
     err = context.error
     if isinstance(err, (Conflict, NetworkError, TimedOut)):
-        # Ignore transient polling conflicts during Render zero-downtime redeploy
         return
     print(f"Handled runtime warning: {err}")
 
@@ -579,6 +581,7 @@ async def health_check(request):
         {
             "status": "alive",
             "bot_running": config.get("running", False),
+            "next_ad_number": config.get("ad_counter", 1),
             "rounds_completed": stats["rounds_completed"],
             "total_sent": stats["total_sent"],
             "current_state": stats["last_status"],
@@ -598,7 +601,6 @@ async def start_web_server():
 
 
 def build_httpx_request():
-    # Force IPv4 local_address="0.0.0.0" inside httpx transport so Render never hangs on IPv6
     transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=3)
     return HTTPXRequest(
         connect_timeout=30.0,
