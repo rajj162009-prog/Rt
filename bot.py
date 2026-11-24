@@ -6,9 +6,12 @@ import socket
 import random
 import string
 import asyncio
+from datetime import datetime
+import httpx
 from aiohttp import web
 from telegram import Update, InlineKeyboardButton, InlineKeyboardMarkup
 from telegram.request import HTTPXRequest
+from telegram.error import Conflict, NetworkError, TimedOut
 from telegram.ext import (
     Application,
     CommandHandler,
@@ -19,9 +22,16 @@ from telegram.ext import (
 )
 from telethon import TelegramClient
 from telethon.sessions import StringSession
-from telethon.errors import SessionPasswordNeededError, FloodWaitError
+from telethon.errors import (
+    SessionPasswordNeededError,
+    FloodWaitError,
+    SlowModeWaitError,
+    ChatWriteForbiddenError,
+    ChannelPrivateError,
+    UserBannedInChannelError,
+)
 
-# Force IPv4 to prevent Render IPv6 ReadTimeout with Telegram servers
+# 1. Force IPv4 globally to stop Render IPv6 ReadTimeout hangs
 _orig_getaddrinfo = socket.getaddrinfo
 
 
@@ -33,14 +43,14 @@ def _ipv4_getaddrinfo(*args, **kwargs):
 
 socket.getaddrinfo = _ipv4_getaddrinfo
 
-# Environment Variables
+# 2. Load & Validate Environment Variables
 raw_api_id = os.environ.get("API_ID", "").strip()
 API_HASH = os.environ.get("API_HASH", "").strip()
 BOT_TOKEN = os.environ.get("BOT_TOKEN", "").strip()
 raw_owner_id = os.environ.get("OWNER_ID", "0").strip()
 
 if not raw_api_id.isdigit() or not API_HASH or not BOT_TOKEN:
-    print("ERROR: API_ID, API_HASH, aur BOT_TOKEN environment variables check karein!")
+    print("FATAL ERROR: Render Environment Variables mein API_ID, API_HASH, aur BOT_TOKEN check karein!")
     sys.exit(1)
 
 API_ID = int(raw_api_id)
@@ -54,13 +64,17 @@ def load_data():
     if os.path.exists(DATA_FILE):
         try:
             with open(DATA_FILE, "r", encoding="utf-8") as f:
-                return json.load(f)
+                data = json.load(f)
+                # Fallback to env SESSION_STRING if file session is empty
+                if not data.get("session") and os.environ.get("SESSION_STRING", "").strip():
+                    data["session"] = os.environ.get("SESSION_STRING", "").strip()
+                return data
         except Exception:
             pass
     return {
         "session": os.environ.get("SESSION_STRING", "").strip(),
-        "ad_text": "",
-        "delay": 120,
+        "ad_text": os.environ.get("DEFAULT_AD", "").strip(),
+        "delay": int(os.environ.get("DEFAULT_DELAY", "120")),
         "running": False,
     }
 
@@ -70,12 +84,23 @@ def save_data(data):
         with open(DATA_FILE, "w", encoding="utf-8") as f:
             json.dump(data, f, ensure_ascii=False, indent=2)
     except Exception as e:
-        print(f"Save warning: {e}")
+        print(f"File save warning: {e}")
 
 
 config = load_data()
 user_states = {}
 ad_task = None
+bot_app = None
+
+# Live runtime stats
+stats = {
+    "rounds_completed": 0,
+    "total_sent": 0,
+    "last_round_sent": 0,
+    "last_round_skipped": 0,
+    "last_run_time": "Abhi tak nahi chala",
+    "last_status": "Idle",
+}
 
 
 def create_telethon_client(session_str=""):
@@ -86,6 +111,8 @@ def create_telethon_client(session_str=""):
         device_model="Samsung Galaxy S23",
         system_version="Android 14",
         app_version="10.14.5",
+        lang_code="en",
+        system_lang_code="en-US",
         connection_retries=5,
         retry_delay=3,
         timeout=30,
@@ -107,14 +134,16 @@ def format_human_ad(base_text):
 def get_main_menu():
     acc_status = "Logged In" if config.get("session") else "Not Logged In"
     ad_status = "Set" if config.get("ad_text") else "Not Set"
-    run_status = "Running" if config.get("running") else "Stopped"
+    run_status = "RUNNING" if config.get("running") else "STOPPED"
 
     text = (
         f"<b>Ad Bot Control Panel</b>\n\n"
         f"• <b>Account:</b> {acc_status}\n"
         f"• <b>Ad Text:</b> {ad_status}\n"
         f"• <b>Round Delay:</b> {config.get('delay')} sec\n"
-        f"• <b>Status:</b> {run_status}"
+        f"• <b>Bot Status:</b> {run_status}\n"
+        f"• <b>Total Ads Sent:</b> {stats['total_sent']} (Rounds: {stats['rounds_completed']})\n"
+        f"• <b>Current State:</b> {html.escape(stats['last_status'])}"
     )
     keyboard = InlineKeyboardMarkup(
         [
@@ -125,6 +154,7 @@ def get_main_menu():
                 InlineKeyboardButton("Start Bot", callback_data="start_bot"),
                 InlineKeyboardButton("Stop Bot", callback_data="stop_bot"),
             ],
+            [InlineKeyboardButton("Refresh Status & Preview", callback_data="refresh_status")],
         ]
     )
     return text, keyboard
@@ -136,59 +166,130 @@ def cancel_keyboard():
     )
 
 
+async def notify_owner(text):
+    if bot_app and OWNER_ID:
+        try:
+            await bot_app.bot.send_message(chat_id=OWNER_ID, text=text, parse_mode="HTML")
+        except Exception as e:
+            print(f"Notify owner warning: {e}")
+
+
 async def ad_worker():
     global config
     if not config.get("session"):
         config["running"] = False
+        stats["last_status"] = "Stopped (No account logged in)"
         save_data(config)
         return
 
     user_client = create_telethon_client(config["session"])
     try:
+        stats["last_status"] = "Connecting to Telegram..."
         await user_client.connect()
+
         if not await user_client.is_user_authorized():
             config["running"] = False
             config["session"] = ""
+            stats["last_status"] = "Session Expired - Dobara Login Karein"
             save_data(config)
+            await notify_owner("Account session expire ho gaya hai. Dobara <b>1. Account Login</b> karein.")
             return
 
         while config.get("running"):
             ad_text = config.get("ad_text", "").strip()
             if not ad_text:
+                stats["last_status"] = "Waiting for Ad Message..."
                 await asyncio.sleep(5)
                 continue
 
+            stats["last_status"] = "Fetching groups list..."
+            groups = []
             async for dialog in user_client.iter_dialogs():
+                if dialog.is_group:
+                    groups.append(dialog)
+
+            if not groups:
+                stats["last_status"] = "No groups found in this account!"
+                await notify_owner("Is account mein koi Telegram group join nahi hai. Pehle kuch groups join karein.")
+                await asyncio.sleep(30)
+                continue
+
+            # Human behavior: randomize group order every round
+            random.shuffle(groups)
+
+            sent_count = 0
+            skipped_count = 0
+
+            for idx, dialog in enumerate(groups, start=1):
                 if not config.get("running"):
                     break
-                if dialog.is_group:
+
+                try:
+                    stats["last_status"] = f"Sending ({idx}/{len(groups)}): {dialog.name[:20]}"
+
+                    # Human behavior 1: mark recent messages as read before typing
                     try:
-                        # Human-like typing indicator
-                        async with user_client.action(dialog.id, "typing"):
-                            await asyncio.sleep(random.uniform(1.5, 3.5))
-
-                        final_msg = format_human_ad(ad_text)
-                        await user_client.send_message(dialog.id, final_msg)
-
-                        # Natural pause between groups
-                        await asyncio.sleep(random.uniform(3.5, 7.5))
-
-                    except FloodWaitError as e:
-                        await asyncio.sleep(e.seconds + 5)
+                        await user_client.send_read_acknowledge(dialog.id)
                     except Exception:
-                        continue
+                        pass
+
+                    # Human behavior 2: realistic typing indicator
+                    async with user_client.action(dialog.id, "typing"):
+                        await asyncio.sleep(random.uniform(2.0, 4.2))
+
+                    final_msg = format_human_ad(ad_text)
+                    await user_client.send_message(dialog.id, final_msg)
+
+                    sent_count += 1
+                    stats["total_sent"] += 1
+
+                    # Human behavior 3: natural pause between groups
+                    await asyncio.sleep(random.uniform(4.0, 8.5))
+
+                except FloodWaitError as e:
+                    wait_sec = e.seconds + 5
+                    stats["last_status"] = f"FloodWait: waiting {wait_sec}s..."
+                    await asyncio.sleep(wait_sec)
+                except (SlowModeWaitError, ChatWriteForbiddenError, ChannelPrivateError, UserBannedInChannelError):
+                    skipped_count += 1
+                    continue
+                except Exception:
+                    skipped_count += 1
+                    continue
+
+            if not config.get("running"):
+                break
+
+            stats["rounds_completed"] += 1
+            stats["last_round_sent"] = sent_count
+            stats["last_round_skipped"] = skipped_count
+            stats["last_run_time"] = datetime.now().strftime("%H:%M:%S")
 
             base_delay = int(config.get("delay", 120))
-            jitter = random.randint(5, 25)
+            jitter = random.randint(8, 25)
             total_sleep = base_delay + jitter
 
-            for _ in range(total_sleep):
+            stats["last_status"] = f"Round #{stats['rounds_completed']} done ({sent_count} sent). Next in {total_sleep}s"
+
+            await notify_owner(
+                f"<b>Round #{stats['rounds_completed']} Complete</b>\n"
+                f"• <b>Sent:</b> {sent_count} groups\n"
+                f"• <b>Skipped/Locked:</b> {skipped_count} groups\n"
+                f"• <b>Next Round:</b> {total_sleep} seconds baad"
+            )
+
+            for remaining in range(total_sleep, 0, -1):
                 if not config.get("running"):
                     break
+                stats["last_status"] = f"Waiting {remaining}s for next round..."
                 await asyncio.sleep(1)
+
     except Exception as e:
-        print(f"Ad worker error: {e}")
+        stats["last_status"] = f"Error: {str(e)[:40]}"
+        print(f"Ad worker exception: {e}")
     finally:
+        if not config.get("running"):
+            stats["last_status"] = "Stopped"
         try:
             await user_client.disconnect()
         except Exception:
@@ -252,28 +353,41 @@ async def callback_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
     elif data == "start_bot":
         if not config.get("session"):
-            await query.answer("Pehle Account Login karein!", show_alert=True)
+            await query.answer("Pehle 1. Account Login karein!", show_alert=True)
             return
         if not config.get("ad_text"):
-            await query.answer("Pehle Ad Message set karein!", show_alert=True)
+            await query.answer("Pehle 2. Set Ad Message karein!", show_alert=True)
             return
-        if config.get("running"):
+        if config.get("running") and ad_task and not ad_task.done():
             await query.answer("Bot pehle se chal raha hai!", show_alert=True)
             return
 
-        await query.answer("Bot start ho gaya!")
+        await query.answer("Ad Bot Start Ho Gaya!")
         config["running"] = True
         save_data(config)
         start_ad_loop()
+        await asyncio.sleep(0.5)
         text, keyboard = get_main_menu()
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
 
     elif data == "stop_bot":
-        await query.answer("Bot stop ho gaya!")
+        await query.answer("Ad Bot Stop Ho Gaya!")
         config["running"] = False
+        stats["last_status"] = "Stopped by user"
         save_data(config)
         text, keyboard = get_main_menu()
         await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+
+    elif data == "refresh_status":
+        await query.answer("Status refreshed!")
+        text, keyboard = get_main_menu()
+        if config.get("ad_text"):
+            sample = format_human_ad(config["ad_text"])
+            text += f"\n\n<b>Live Ad Sample:</b>\n<code>{html.escape(sample)}</code>"
+        try:
+            await query.edit_message_text(text, reply_markup=keyboard, parse_mode="HTML")
+        except Exception:
+            pass
 
     elif data == "cancel":
         await query.answer()
@@ -305,6 +419,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
     if step == "WAIT_PHONE":
         client = create_telethon_client()
         try:
+            await update.message.reply_text("OTP bheja ja raha hai, 2 second rukein...")
             await client.connect()
             sent = await client.send_code_request(msg_text)
             user_states[uid] = {
@@ -314,7 +429,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 "client": client,
             }
             await update.message.reply_text(
-                "Telegram par OTP aaya hoga. <b>Spaces ke saath</b> OTP bhejein (jaise <code>1 2 3 4 5</code>):",
+                "Telegram par OTP aaya hoga.\n"
+                "<b>IMPORTANT:</b> OTP ko <b>spaces ke saath</b> bhejein (jaise <code>1 2 3 4 5</code>), bina spaces ke bhejne par Telegram OTP block kar deta hai:"
+                ,
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -324,7 +441,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
                 pass
             user_states.pop(uid, None)
             await update.message.reply_text(
-                f"Error: {html.escape(str(e))}\nDobara /start bhejein.",
+                f"OTP Error: {html.escape(str(e))}\nDobara /start bhejein.",
                 parse_mode="HTML",
             )
 
@@ -345,7 +462,10 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             user_states[uid] = {"step": "WAIT_AD", "auto_flow": True}
             await update.message.reply_text(
-                "Account successfully login ho gaya!\n\nAb apna <b>Ad Message</b> bhejein:",
+                "Account successfully login ho gaya!\n\n"
+                "<b>Permanent Login Backup (Optional):</b> Agar aap chahte hain ki Render restart hone par bhi kabhi logout na ho, toh Render Environment Variables mein <code>SESSION_STRING</code> key banakar yeh value paste kar dein:\n"
+                f"<code>{html.escape(session_str)}</code>\n\n"
+                "Ab agla step: Apna <b>Ad Message</b> bhejein:",
                 parse_mode="HTML",
             )
 
@@ -377,7 +497,9 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
             user_states[uid] = {"step": "WAIT_AD", "auto_flow": True}
             await update.message.reply_text(
-                "2FA verified! Account login ho gaya.\n\nAb apna <b>Ad Message</b> bhejein:",
+                "2FA verified! Account login ho gaya.\n\n"
+                f"<b>Session Backup:</b> <code>{html.escape(session_str)}</code>\n\n"
+                "Ab apna <b>Ad Message</b> bhejein:",
                 parse_mode="HTML",
             )
         except Exception as e:
@@ -427,6 +549,7 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
             config["running"] = True
             save_data(config)
             start_ad_loop()
+            await asyncio.sleep(0.5)
             text, keyboard = get_main_menu()
             await update.message.reply_text(
                 f"Delay {msg_text}s set ho gaya aur <b>Bot automatic start ho gaya hai!</b>\n\n{text}",
@@ -444,16 +567,29 @@ async def message_handler(update: Update, context: ContextTypes.DEFAULT_TYPE):
 
 
 async def error_handler(update: object, context: ContextTypes.DEFAULT_TYPE):
-    print(f"Handled network/runtime warning: {context.error}")
+    err = context.error
+    if isinstance(err, (Conflict, NetworkError, TimedOut)):
+        # Ignore transient polling conflicts during Render zero-downtime redeploy
+        return
+    print(f"Handled runtime warning: {err}")
 
 
 async def health_check(request):
-    return web.Response(text="Ad Bot is alive!")
+    return web.json_response(
+        {
+            "status": "alive",
+            "bot_running": config.get("running", False),
+            "rounds_completed": stats["rounds_completed"],
+            "total_sent": stats["total_sent"],
+            "current_state": stats["last_status"],
+        }
+    )
 
 
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/", health_check)
+    app.router.add_get("/health", health_check)
     runner = web.AppRunner(app)
     await runner.setup()
     port = int(os.environ.get("PORT", 10000))
@@ -461,30 +597,30 @@ async def start_web_server():
     await site.start()
 
 
+def build_httpx_request():
+    # Force IPv4 local_address="0.0.0.0" inside httpx transport so Render never hangs on IPv6
+    transport = httpx.AsyncHTTPTransport(local_address="0.0.0.0", retries=3)
+    return HTTPXRequest(
+        connect_timeout=30.0,
+        read_timeout=30.0,
+        write_timeout=30.0,
+        pool_timeout=30.0,
+        httpx_kwargs={"transport": transport},
+    )
+
+
 async def main():
+    global bot_app
     await start_web_server()
-    print("Web server bound successfully.")
+    print("Web server bound successfully on port", os.environ.get("PORT", 10000))
 
     while True:
         try:
-            req = HTTPXRequest(
-                connect_timeout=30.0,
-                read_timeout=30.0,
-                write_timeout=30.0,
-                pool_timeout=30.0,
-            )
-            updates_req = HTTPXRequest(
-                connect_timeout=30.0,
-                read_timeout=30.0,
-                write_timeout=30.0,
-                pool_timeout=30.0,
-            )
-
             application = (
                 Application.builder()
                 .token(BOT_TOKEN)
-                .request(req)
-                .get_updates_request(updates_req)
+                .request(build_httpx_request())
+                .get_updates_request(build_httpx_request())
                 .build()
             )
             application.add_handler(CommandHandler("start", start_handler))
@@ -499,8 +635,10 @@ async def main():
             await application.updater.start_polling(
                 drop_pending_updates=True,
                 timeout=20,
+                bootstrap_retries=-1,
             )
 
+            bot_app = application
             print("Controller Bot successfully started and connected!")
 
             if config.get("running") and config.get("session"):
@@ -509,7 +647,7 @@ async def main():
             await asyncio.Event().wait()
 
         except Exception as e:
-            print(f"Connection retry in 5s due to: {e}")
+            print(f"Retrying connection in 5s due to: {e}")
             await asyncio.sleep(5)
 
 
